@@ -3,9 +3,16 @@ import sys
 import asyncio
 import logging
 import shutil
+import zipfile
 from io import BytesIO
 from collections import defaultdict
 from datetime import datetime
+
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
 
 # ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
 logging.basicConfig(
@@ -39,6 +46,104 @@ class Config:
 
 config = Config()
 logger.info(f"✅ Конфигурация загружена")
+
+# Глобальная переменная для пути к FFmpeg
+FFMPEG_PATH = None
+
+# ========== АВТОЗАГРУЗКА FFMPEG ==========
+async def ensure_ffmpeg() -> str:
+    """Проверяет наличие ffmpeg, при отсутствии скачивает"""
+    global FFMPEG_PATH
+    
+    # Сначала проверяем систему
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        logger.info(f"✅ FFmpeg найден: {ffmpeg_path}")
+        FFMPEG_PATH = ffmpeg_path
+        return ffmpeg_path
+    
+    # Проверяем локальную папку
+    if sys.platform == "win32":
+        local_ffmpeg = "ffmpeg.exe"
+    else:
+        local_ffmpeg = "ffmpeg"
+    
+    if os.path.exists(local_ffmpeg):
+        logger.info(f"✅ FFmpeg найден локально: {local_ffmpeg}")
+        FFMPEG_PATH = local_ffmpeg
+        return local_ffmpeg
+    
+    # Пытаемся скачать
+    if not AIOHTTP_AVAILABLE:
+        logger.error("❌ FFmpeg не найден и aiohttp не установлен")
+        return None
+    
+    logger.info("⏳ FFmpeg не найден, скачиваю...")
+    
+    try:
+        # Ссылки на статические билды FFmpeg
+        if sys.platform == "win32":
+            ffmpeg_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        elif sys.platform == "linux":
+            ffmpeg_url = "https://johnvansickle.com/ffmpeg/builds/ffmpeg-git-amd64-static.tar.xz"
+        else:
+            logger.error(f"❌ Платформа {sys.platform} не поддерживается для автозагрузки")
+            return None
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(ffmpeg_url, timeout=300) as response:
+                if response.status != 200:
+                    logger.error(f"❌ Ошибка загрузки FFmpeg: {response.status}")
+                    return None
+                
+                data = await response.read()
+                
+                # Сохраняем архив
+                archive_name = "ffmpeg_archive.zip" if sys.platform == "win32" else "ffmpeg_archive.tar.xz"
+                with open(archive_name, "wb") as f:
+                    f.write(data)
+                
+                logger.info("📦 Архив загружен, распаковываю...")
+                
+                # Распаковываем
+                if sys.platform == "win32":
+                    with zipfile.ZipFile(archive_name, 'r') as zip_ref:
+                        zip_ref.extractall("ffmpeg_extracted")
+                    
+                    # Ищем exe файл
+                    for root, dirs, files in os.walk("ffmpeg_extracted"):
+                        for file in files:
+                            if file.endswith("ffmpeg.exe"):
+                                src = os.path.join(root, file)
+                                shutil.copy(src, local_ffmpeg)
+                                break
+                    shutil.rmtree("ffmpeg_extracted")
+                else:
+                    import tarfile
+                    with tarfile.open(archive_name, 'r:xz') as tar_ref:
+                        tar_ref.extractall("ffmpeg_extracted")
+                    
+                    for root, dirs, files in os.walk("ffmpeg_extracted"):
+                        for file in files:
+                            if file == "ffmpeg":
+                                src = os.path.join(root, file)
+                                shutil.copy(src, local_ffmpeg)
+                                os.chmod(local_ffmpeg, 0o755)
+                                break
+                    shutil.rmtree("ffmpeg_extracted")
+                
+                # Удаляем архив
+                os.remove(archive_name)
+                
+                if os.path.exists(local_ffmpeg):
+                    logger.info(f"✅ FFmpeg загружен: {local_ffmpeg}")
+                    FFMPEG_PATH = local_ffmpeg
+                    return local_ffmpeg
+                    
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки FFmpeg: {e}")
+    
+    return None
 
 # ========== ХРАНЕНИЕ АЛЬБОМОВ ==========
 album_storage = defaultdict(list)
@@ -172,17 +277,28 @@ async def process_album(messages: list):
     
     await status_msg.delete()
 
-# ========== ФУНКЦИЯ КОНВЕРТАЦИИ ВИДЕО В КРУЖОК (ИСПРАВЛЕННАЯ) ==========
-async def convert_to_circle(input_path: str, output_path: str) -> bool:
-    """
-    Конвертирует видео в формат Video Note (кружок).
-    ИСПРАВЛЕНО: force_original_aspect_ratio=increase для корректной обрезки
-    """
-    
-    ffmpeg_path = shutil.which("ffmpeg")
-    
+# ========== ФУНКЦИЯ КОНВЕРТАЦИИ ВИДЕО В КРУЖОК ==========
+async def convert_to_circle(input_path: str, output_path: str, ffmpeg_path: str = None) -> bool:
+    """Конвертирует видео в формат Video Note (кружок)"""
+
     if not ffmpeg_path:
-        logger.error("❌ FFmpeg не найден в PATH!")
+        ffmpeg_path = shutil.which("ffmpeg")
+    
+    # Если не найден, пробуем альтернативные пути
+    if not ffmpeg_path:
+        possible_paths = [
+            "/usr/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "./ffmpeg",
+            "ffmpeg.exe"
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                ffmpeg_path = path
+                break
+
+    if not ffmpeg_path:
+        logger.error("❌ FFmpeg не найден в системе!")
         return False
     
     if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
@@ -301,19 +417,19 @@ async def start_video_mode(callback: CallbackQuery, state: FSMContext):
 async def handle_video(message: Message, state: FSMContext):
     video = message.video
     file = await bot.get_file(video.file_id)
-    
+
     temp_in = f"temp_{video.file_id}.mp4"
     temp_out = f"circle_{video.file_id}.mp4"
-    
+
     status = await message.answer("⏳ Конвертирую видео в кружок...")
-    
+
     try:
         logger.info(f"📥 Скачивание видео: {video.file_id}")
         await bot.download_file(file.file_path, temp_in)
         logger.info(f"✅ Видео скачано: {temp_in} ({os.path.getsize(temp_in)} байт)")
-        
-        success = await convert_to_circle(temp_in, temp_out)
-        
+
+        success = await convert_to_circle(temp_in, temp_out, FFMPEG_PATH)
+
         if success:
             logger.info(f"📤 Отправка кружка: {temp_out}")
             with open(temp_out, 'rb') as f:
@@ -329,11 +445,11 @@ async def handle_video(message: Message, state: FSMContext):
                 "❌ Не удалось создать кружок.\n\n"
                 "📋 Проверьте консоль бота для подробной ошибки."
             )
-            
+
     except Exception as e:
         logger.error(f"Ошибка обработки видео: {e}")
         await message.answer("❌ Произошла непредвиденная ошибка")
-        
+
     finally:
         for f in [temp_in, temp_out]:
             if os.path.exists(f):
@@ -376,11 +492,10 @@ async def main():
     else:
         logger.warning("⚠️ Логотип не загружен")
 
-    ffmpeg_path = shutil.which("ffmpeg")
-    if ffmpeg_path:
-        logger.info(f"✅ FFmpeg найден: {ffmpeg_path}")
-    else:
-        logger.warning("⚠️ FFmpeg не найден — кружки не будут работать")
+    # Проверяем/загружаем FFmpeg
+    ffmpeg_path = await ensure_ffmpeg()
+    if not ffmpeg_path:
+        logger.warning("⚠️ FFmpeg недоступен — кружки не будут работать")
 
     asyncio.create_task(cleanup_old_albums())
 
