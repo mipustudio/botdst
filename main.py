@@ -278,12 +278,12 @@ async def process_album(messages: list):
     await status_msg.delete()
 
 # ========== ФУНКЦИЯ КОНВЕРТАЦИИ ВИДЕО В КРУЖОК ==========
-async def convert_to_circle(input_path: str, output_path: str, ffmpeg_path: str = None) -> bool:
+async def convert_to_circle(input_path: str, output_path: str, ffmpeg_path: str = None, max_duration: int = 60) -> bool:
     """Конвертирует видео в формат Video Note (кружок)"""
 
     if not ffmpeg_path:
         ffmpeg_path = shutil.which("ffmpeg")
-    
+
     # Если не найден, пробуем альтернативные пути
     if not ffmpeg_path:
         possible_paths = [
@@ -300,59 +300,89 @@ async def convert_to_circle(input_path: str, output_path: str, ffmpeg_path: str 
     if not ffmpeg_path:
         logger.error("❌ FFmpeg не найден в системе!")
         return False
-    
+
     if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
         logger.error(f"❌ Проблема с входным файлом: {input_path}")
         return False
 
-    # ✅ ИСПРАВЛЕННАЯ КОМАНДА:
-    # - scale с increase: видео увеличивается, чтобы ПОКРЫТЬ 640×640
-    # - crop: обрезает центр до точного квадрата
-    # - -an: убираем аудио (не нужно для кружков)
-    # - -preset fast: быстрее кодирование
-    # - -crf 23: баланс качества и размера
+    # Команда FFmpeg для создания кружка
+    # Telegram требует: MP4, H.264, 640x640, до 60 сек, без аудио, < 1 МБ
     cmd = [
         ffmpeg_path,
         "-i", input_path,
         "-vf", "scale=640:640:force_original_aspect_ratio=increase,crop=640:640",
         "-c:v", "libx264",
         "-preset", "fast",
-        "-crf", "23",
+        "-crf", "28",  # Больше = меньше качество, но меньше размер
         "-pix_fmt", "yuv420p",
-        "-t", "60",
+        "-t", str(max_duration),
         "-an",
         "-movflags", "+faststart",
         "-y",
         output_path
     ]
-    
+
     try:
-        logger.info(f"🔄 FFmpeg: {' '.join(cmd)}")
-        
+        logger.info(f"🔄 FFmpeg команда: {' '.join(cmd)}")
+
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        
+
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
-        
+
         if process.returncode == 0:
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                logger.info(f"✅ Конвертация успешна! Размер: {os.path.getsize(output_path)} байт")
+                size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                logger.info(f"✅ Конвертация успешна! Размер: {size_mb:.2f} МБ")
+                
+                # Если файл больше 1 МБ, пробуем сжать сильнее
+                if size_mb > 1.0:
+                    logger.info("⚠️ Файл больше 1 МБ, пробуем сжатие...")
+                    cmd_compress = [
+                        ffmpeg_path,
+                        "-i", output_path,
+                        "-c:v", "libx264",
+                        "-preset", "slow",
+                        "-crf", "30",
+                        "-pix_fmt", "yuv420p",
+                        "-movflags", "+faststart",
+                        "-y",
+                        output_path + ".compressed"
+                    ]
+                    
+                    process_compress = await asyncio.create_subprocess_exec(
+                        *cmd_compress,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    
+                    stdout_c, stderr_c = await asyncio.wait_for(process_compress.communicate(), timeout=120)
+                    
+                    if process_compress.returncode == 0 and os.path.exists(output_path + ".compressed"):
+                        os.remove(output_path)
+                        os.rename(output_path + ".compressed", output_path)
+                        new_size = os.path.getsize(output_path) / (1024 * 1024)
+                        logger.info(f"✅ Сжатие успешно! Новый размер: {new_size:.2f} МБ")
+                
                 return True
-        
+            else:
+                logger.error("❌ Выходной файл пуст или не создан")
+                return False
+
         error_msg = stderr.decode('utf-8', errors='ignore')
-        logger.error(f"❌ FFmpeg ошибка: {error_msg[:800]}")
+        logger.error(f"❌ FFmpeg ошибка (код {process.returncode}): {error_msg[:800]}")
         return False
-        
+
     except asyncio.TimeoutError:
         logger.error("❌ Таймаут FFmpeg (>120 сек)")
         if process:
             process.kill()
         return False
     except Exception as e:
-        logger.error(f"❌ Ошибка: {type(e).__name__}: {e}")
+        logger.error(f"❌ Ошибка конвертации: {type(e).__name__}: {e}")
         return False
 
 # ========== КЛАВИАТУРЫ ==========
@@ -418,26 +448,34 @@ async def handle_video(message: Message, state: FSMContext):
     video = message.video
     file = await bot.get_file(video.file_id)
 
-    temp_in = f"temp_{video.file_id}.mp4"
-    temp_out = f"circle_{video.file_id}.mp4"
+    # Уникальные имена временных файлов
+    temp_in = f"temp_in_{message.from_user.id}_{int(asyncio.get_event_loop().time())}.mp4"
+    temp_out = f"temp_out_{message.from_user.id}_{int(asyncio.get_event_loop().time())}.mp4"
 
     status = await message.answer("⏳ Конвертирую видео в кружок...")
 
     try:
         logger.info(f"📥 Скачивание видео: {video.file_id}")
         await bot.download_file(file.file_path, temp_in)
-        logger.info(f"✅ Видео скачано: {temp_in} ({os.path.getsize(temp_in)} байт)")
+        
+        input_size = os.path.getsize(temp_in)
+        logger.info(f"✅ Видео скачано: {temp_in} ({input_size / (1024*1024):.2f} МБ)")
 
         success = await convert_to_circle(temp_in, temp_out, FFMPEG_PATH)
 
-        if success:
-            logger.info(f"📤 Отправка кружка: {temp_out}")
+        if success and os.path.exists(temp_out):
+            output_size = os.path.getsize(temp_out)
+            logger.info(f"📤 Отправка кружка: {temp_out} ({output_size / (1024*1024):.2f} МБ)")
+            
+            # Получаем длительность из выходного файла
+            actual_duration = min(video.duration or 60, 60)
+            
             with open(temp_out, 'rb') as f:
                 await bot.send_video_note(
                     chat_id=message.chat.id,
-                    video_note=BufferedInputFile(f.read(), "circle.mp4"),
+                    video_note=f.read(),
                     length=640,
-                    duration=min(video.duration or 60, 60)
+                    duration=actual_duration
                 )
             logger.info("✅ Кружок отправлен")
         else:
@@ -447,17 +485,18 @@ async def handle_video(message: Message, state: FSMContext):
             )
 
     except Exception as e:
-        logger.error(f"Ошибка обработки видео: {e}")
-        await message.answer("❌ Произошла непредвиденная ошибка")
+        logger.error(f"Ошибка обработки видео: {type(e).__name__}: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка: {type(e).__name__}\n\n{str(e)[:200]}")
 
     finally:
+        # Очистка временных файлов
         for f in [temp_in, temp_out]:
-            if os.path.exists(f):
+            if f and os.path.exists(f):
                 try:
                     os.remove(f)
                     logger.info(f"🧹 Удалён временный файл: {f}")
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"⚠️ Не удалось удалить {f}: {e}")
         await status.delete()
         await state.set_state(UserState.waiting_for_action)
 
