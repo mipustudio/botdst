@@ -58,7 +58,7 @@ async def ensure_ffmpeg() -> str:
     # Сначала проверяем систему
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
-        logger.info(f"✅ FFmpeg найден: {ffmpeg_path}")
+        logger.info(f"✅ FFmpeg найден в системе: {ffmpeg_path}")
         FFMPEG_PATH = ffmpeg_path
         return ffmpeg_path
     
@@ -68,26 +68,29 @@ async def ensure_ffmpeg() -> str:
     else:
         local_ffmpeg = "ffmpeg"
     
-    if os.path.exists(local_ffmpeg):
+    if os.path.exists(local_ffmpeg) and os.access(local_ffmpeg, os.X_OK):
         logger.info(f"✅ FFmpeg найден локально: {local_ffmpeg}")
-        FFMPEG_PATH = local_ffmpeg
-        return local_ffmpeg
+        FFMPEG_PATH = os.path.abspath(local_ffmpeg)
+        return FFMPEG_PATH
     
     # Пытаемся скачать
     if not AIOHTTP_AVAILABLE:
         logger.error("❌ FFmpeg не найден и aiohttp не установлен")
         return None
     
-    logger.info("⏳ FFmpeg не найден, скачиваю...")
+    logger.info("⏳ FFmpeg не найден, скачиваю статическую сборку...")
     
     try:
-        # Ссылки на статические билды FFmpeg
-        if sys.platform == "win32":
+        # Используем statically compiled ffmpeg для Linux
+        if sys.platform == "linux":
+            # Универсальная сборка для Linux x86_64
+            ffmpeg_url = "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v4.4/ffmpeg-4.4-linux-64.zip"
+            archive_name = "ffmpeg.zip"
+        elif sys.platform == "win32":
             ffmpeg_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-        elif sys.platform == "linux":
-            ffmpeg_url = "https://johnvansickle.com/ffmpeg/builds/ffmpeg-git-amd64-static.tar.xz"
+            archive_name = "ffmpeg.zip"
         else:
-            logger.error(f"❌ Платформа {sys.platform} не поддерживается для автозагрузки")
+            logger.error(f"❌ Платформа {sys.platform} не поддерживается")
             return None
         
         async with aiohttp.ClientSession() as session:
@@ -96,52 +99,47 @@ async def ensure_ffmpeg() -> str:
                     logger.error(f"❌ Ошибка загрузки FFmpeg: {response.status}")
                     return None
                 
+                logger.info("📦 Загрузка FFmpeg...")
                 data = await response.read()
                 
                 # Сохраняем архив
-                archive_name = "ffmpeg_archive.zip" if sys.platform == "win32" else "ffmpeg_archive.tar.xz"
                 with open(archive_name, "wb") as f:
                     f.write(data)
                 
                 logger.info("📦 Архив загружен, распаковываю...")
                 
                 # Распаковываем
-                if sys.platform == "win32":
-                    with zipfile.ZipFile(archive_name, 'r') as zip_ref:
-                        zip_ref.extractall("ffmpeg_extracted")
-                    
-                    # Ищем exe файл
-                    for root, dirs, files in os.walk("ffmpeg_extracted"):
-                        for file in files:
-                            if file.endswith("ffmpeg.exe"):
-                                src = os.path.join(root, file)
-                                shutil.copy(src, local_ffmpeg)
-                                break
-                    shutil.rmtree("ffmpeg_extracted")
-                else:
-                    import tarfile
-                    with tarfile.open(archive_name, 'r:xz') as tar_ref:
-                        tar_ref.extractall("ffmpeg_extracted")
-                    
-                    for root, dirs, files in os.walk("ffmpeg_extracted"):
-                        for file in files:
-                            if file == "ffmpeg":
-                                src = os.path.join(root, file)
-                                shutil.copy(src, local_ffmpeg)
-                                os.chmod(local_ffmpeg, 0o755)
-                                break
-                    shutil.rmtree("ffmpeg_extracted")
+                with zipfile.ZipFile(archive_name, 'r') as zip_ref:
+                    zip_ref.extractall("ffmpeg_tmp")
                 
-                # Удаляем архив
+                # Ищем файл ffmpeg
+                found = False
+                for root, dirs, files in os.walk("ffmpeg_tmp"):
+                    for file in files:
+                        if file.startswith("ffmpeg") and (file.endswith(".exe") or sys.platform != "win32"):
+                            src = os.path.join(root, file)
+                            shutil.copy(src, local_ffmpeg)
+                            if sys.platform != "win32":
+                                os.chmod(local_ffmpeg, 0o755)
+                            found = True
+                            break
+                    if found:
+                        break
+                
+                # Удаляем временные файлы
+                shutil.rmtree("ffmpeg_tmp")
                 os.remove(archive_name)
                 
-                if os.path.exists(local_ffmpeg):
-                    logger.info(f"✅ FFmpeg загружен: {local_ffmpeg}")
-                    FFMPEG_PATH = local_ffmpeg
-                    return local_ffmpeg
+                if found and os.path.exists(local_ffmpeg):
+                    FFMPEG_PATH = os.path.abspath(local_ffmpeg)
+                    logger.info(f"✅ FFmpeg загружен: {FFMPEG_PATH}")
+                    return FFMPEG_PATH
+                else:
+                    logger.error("❌ Не удалось найти файл ffmpeg в архиве")
+                    return None
                     
     except Exception as e:
-        logger.error(f"❌ Ошибка загрузки FFmpeg: {e}")
+        logger.error(f"❌ Ошибка загрузки FFmpeg: {type(e).__name__}: {e}", exc_info=True)
     
     return None
 
@@ -525,6 +523,7 @@ async def cleanup_old_albums():
 async def main():
     logger.info("🚀 Запускаю Telegram бота...")
     logger.info(f"🤖 Bot ID: {config.BOT_ID or 'не указан'}")
+    logger.info(f"🖥️ Платформа: {sys.platform}")
 
     if LOGO_AVAILABLE:
         logger.info(f"✅ Логотип готов: {logo_image.size}")
@@ -532,9 +531,13 @@ async def main():
         logger.warning("⚠️ Логотип не загружен")
 
     # Проверяем/загружаем FFmpeg
+    logger.info("🔍 Проверка FFmpeg...")
     ffmpeg_path = await ensure_ffmpeg()
-    if not ffmpeg_path:
-        logger.warning("⚠️ FFmpeg недоступен — кружки не будут работать")
+    if ffmpeg_path:
+        logger.info(f"✅ FFmpeg готов: {ffmpeg_path}")
+    else:
+        logger.error("❌ FFmpeg недоступен — кружки не будут работать")
+        logger.error("💡 Совет: установите ffmpeg в системе или загрузите в папку с ботом")
 
     asyncio.create_task(cleanup_old_albums())
 
@@ -543,7 +546,7 @@ async def main():
     except KeyboardInterrupt:
         logger.info("⏹️ Бот остановлен")
     except Exception as e:
-        logger.error(f"💥 Критическая ошибка: {e}")
+        logger.error(f"💥 Критическая ошибка: {e}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":
